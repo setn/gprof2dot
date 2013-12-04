@@ -1169,6 +1169,199 @@ class GprofParser(Parser):
 
         return profile
 
+# Clone of GprofParser for JRuby --profiler.graph:w
+# Tested with JRuby 1.7.4
+class JrubyParser(Parser):
+    """Parser for Jruby GraphProfilePrinter output
+    """
+
+    def __init__(self, fp):
+        Parser.__init__(self)
+        self.fp = fp
+        self.functions = {}
+        self.cycles = {}
+
+    def readline(self):
+        line = self.fp.readline()
+        if not line:
+           return '\014'
+        line = line.rstrip('\r\n')
+        return line
+
+    _int_re = re.compile(r'^\d+$')
+    _float_re = re.compile(r'^\d+[.,]\d+$')
+
+    def jruby_translate(self, mo):
+        """Extract a structure from a match object, while translating the types in the process."""
+        attrs = {}
+        groupdict = mo.groupdict()
+        for name, value in compat_iteritems(groupdict):
+            if value is None:
+                value = None
+            elif self._int_re.match(value):
+                value = int(value)
+            elif self._float_re.match(value):
+                value = value.replace(',', '.') 
+                value = float(value)
+            attrs[name] = (value)
+        return Struct(attrs)
+
+    _jr_header_re = re.compile(
+        r'\s+%total\s+%self\s+total\s+self\s+children\s+calls\s+name|'
+        r'-----------'
+    )
+
+    _jr_ignore_re = re.compile(
+        # spontaneous
+        r'.*\(top\)$'
+    )
+
+    _jr_parent_re = re.compile(
+        r'^\s+(?P<total>\d+[.,]\d+)?' + 
+        r'\s+(?P<self>\d+[.,]\d+)?' + 
+        r'\s+(?P<descendants>\d+[.,]\d+)?' + 
+        r'\s+(?P<called>\d+)(?:/(?P<called_total>\d+))?' + 
+        r'\s+(?P<name>\S.*?)$'
+    )
+
+    _jr_child_re = _jr_parent_re
+
+    _jr_primary_re = re.compile(
+        r'^\s+(?P<percentage_time>\d+)%' + 
+        r'\s+(?P<percentage_self>\d+)%' + 
+        r'\s+(?P<total>\d+[.,]\d+)' + 
+        r'\s+(?P<self>\d+[.,]\d+)' + 
+        r'\s+(?P<descendants>\d+[.,]\d+)' + 
+        r'\s+(?:(?P<called>\d+)(?:\+(?P<called_self>\d+))?)?' + 
+        r'\s+(?P<name>\S.*?)$'
+    )
+
+    _jr_sep_re = re.compile(r'^--+$')
+
+    _jr_cycle_entry_re = re.compile(r'^......%')
+
+    def jruby_parse_function_entry(self, lines):
+        exit
+        parents = []
+        children = []
+
+        while True:
+            if not lines:
+                sys.stderr.write('warning: unexpected end of entry\n')
+            line = lines.pop(0)
+            if self._jr_cycle_entry_re.match(line):
+                break
+        
+            # read function parent line
+            mo = self._jr_parent_re.match(line)
+            if not mo:
+                if self._jr_ignore_re.match(line):
+                    continue
+                sys.stderr.write('warning: unrecognized call graph entry here: %r\n' % line)
+            else:
+                parent = self.jruby_translate(mo)
+                parents.append(parent)
+
+        # read primary line
+        mo = self._jr_primary_re.match(line)
+        if not mo:
+            sys.stderr.write('warning: unrecognized call graph entry 2: %r\n' % line)
+            return
+        else:
+            function = self.jruby_translate(mo)
+
+        while lines:
+            line = lines.pop(0)
+            
+            # read function subroutine line
+            mo = self._jr_child_re.match(line)
+            if not mo:
+                if self._jr_ignore_re.match(line):
+                    continue
+                sys.stderr.write('warning: unrecognized call graph entry 3: %r\n' % line)
+            else:
+                child = self.jruby_translate(mo)
+                children.append(child)
+        
+        function.parents = parents
+        function.children = children
+
+        self.functions[function.name] = function
+
+    def jruby_parse_cg(self):
+        """Parse the call graph."""
+
+        # skip call graph header
+        while not self._jr_header_re.match(self.readline()):
+            pass
+        line = self.readline()
+        while self._jr_header_re.match(line):
+            line = self.readline()
+        sys.stderr.write("Starting to parse" + "\n")
+        # process call graph entries
+        entry_lines = []
+        while line != '\014': # form feed
+            if line and not line.isspace():
+                if self._jr_sep_re.match(line):
+                    self.jruby_parse_function_entry(entry_lines)
+                    entry_lines = []
+                else:
+                    entry_lines.append(line)            
+            line = self.readline()
+        self.jruby_parse_function_entry(entry_lines)
+    
+    def parse(self):
+        self.jruby_parse_cg()
+        self.fp.close()
+
+        profile = Profile()
+        profile[TIME] = 0.0
+        
+        for entry in compat_itervalues(self.functions):
+            # populate the function
+            function = Function(entry.name, entry.name)
+            function[TIME] = entry.self
+            function[TOTAL_TIME] = entry.total
+            function[TOTAL_TIME_RATIO] = entry.percentage_time / 100.0
+            if entry.called is not None:
+                function.called = entry.called
+            if entry.called_self is not None:
+                call = Call(entry.index)
+                call[CALLS] = entry.called_self
+                function.called += entry.called_self
+            
+            # populate the function calls
+            for child in entry.children:
+                call = Call(child.name)
+                
+                assert child.called is not None
+                call[CALLS] = child.called
+
+                if child.name not in self.functions:
+                    # NOTE: functions that were never called but were discovered by gprof's 
+                    # static call graph analysis dont have a call graph entry so we need
+                    # to add them here
+                    missing = Function(child.name, child.name)
+                    function[TIME] = 0.0
+                    function.called = 0
+                    profile.add_function(missing)
+
+                function.add_call(call)
+
+            profile.add_function(function)
+
+            profile[TIME] = profile[TIME] + function[TIME]
+
+
+        # Compute derived events
+        profile.validate()
+        profile.ratio(TIME_RATIO, TIME)
+        profile.call_ratios(CALLS)
+        #profile.integrate(TOTAL_TIME, TIME)
+        #profile.ratio(TOTAL_TIME_RATIO, TOTAL_TIME)
+
+        return profile
+
 
 # Clone&hack of GprofParser for VTune Amplifier XE 2013 gprof-cc output.
 # Tested only with AXE 2013 for Windows.
@@ -3107,6 +3300,7 @@ class Main:
         "oprofile": OprofileParser,
         "perf": PerfParser,
         "prof": GprofParser,
+        "jruby": JrubyParser,
         "pstats": PstatsParser,
         "sleepy": SleepyParser,
         "sysprof": SysprofParser,
